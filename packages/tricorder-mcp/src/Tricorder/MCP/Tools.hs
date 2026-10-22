@@ -140,7 +140,7 @@ toolDescriptions =
             , optTitle = Just "View built status"
             , optFieldDescriptions =
                 [ ("wait", "Block until the current build cycle finishes before returning.")
-                , ("verbose", "Include the full GHC message body under each diagnostic.")
+                , ("verbose", "Include full GHC message bodies and full test suite error messages.")
                 , ("expand", "Only show the summary line and full message body for diagnostic #N.")
                 , projectRootDesc
                 ]

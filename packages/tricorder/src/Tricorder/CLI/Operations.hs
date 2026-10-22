@@ -143,7 +143,7 @@ showStatus opts = do
         Console.putTextLn $ case tr of
             Test.SuiteRunning Nothing -> t <> "  running..."
             Test.SuiteRunning (Just p) -> t <> "  running... (" <> show p.compiled <> "/" <> show p.total <> ")"
-            Test.SuiteErrored e -> t <> "  error: " <> e.message
+            Test.SuiteErrored e -> t <> "  error: " <> errorText e.message
             Test.SuiteCompleted c -> t <> "  " <> completionSummary c
         when (verbosity == Verbose) $ case tr of
             Test.SuiteCompleted c ->
@@ -151,6 +151,9 @@ showStatus opts = do
             _ -> pure ()
       where
         t = TestTarget.render tgt
+        errorText message = case (verbosity, lines message) of
+            (Concise, firstLine : _ : _) -> firstLine <> " (use --verbose to see the full message)"
+            _ -> message
 
     buildHasErrors r = any ((== SError) . (.severity)) r.diagnostics
     buildSummary tz r =

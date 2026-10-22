@@ -102,7 +102,7 @@ statusParser =
                     Verbose
                     ( long "verbose"
                         <> short 'v'
-                        <> help "Print full GHC message body under each diagnostic"
+                        <> help "Print full GHC message body under each diagnostic, and full test suite error messages"
                     )
                 <*> optional
                     ( option

@@ -7,6 +7,12 @@ and this project adheres to the [PVP](https://pvp.haskell.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- The `status` tool now shows only the first line of a test suite's error
+  message unless `verbose` is set.
+  ([#585](https://github.com/tweag/tricorder/issues/585))
+
 ## [0.1.3.1] - 2026-10-20
 
 ### Fixed

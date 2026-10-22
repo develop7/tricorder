@@ -13,6 +13,14 @@ and this project adheres to the [PVP](https://pvp.haskell.org/).
   shut down.
 - Option to set initial commands to pass to GHCi on startup.
 
+### Changed
+
+- `tricorder status` without `--verbose` now shows only the first line of a
+  test suite's error message, unless `--verbose` is set.
+  Previously, a test suite that failed on startup printed
+  the whole cabal/GHCi log on every `status` call.
+  ([#585](https://github.com/tweag/tricorder/issues/585)) (Thanks @RyosukeDTomita!)
+
 ## [0.6.0.0] - 2026-10-20
 
 ### Added
