@@ -1,203 +1,201 @@
 module Unit.Tricorder.Daemon.Ghci.ProcessSpec (test_Process) where
 
+import Atelier.Effects.Conc qualified as Conc
+import Atelier.Effects.Delay qualified as Delay
+import Atelier.Effects.File qualified as File
 import Atelier.Effects.Log (Message (..), Severity (..))
+import Atelier.Effects.Log qualified as Log
 import Atelier.Effects.Process (terminateProcessGroup, withProcessGroup)
+import Atelier.Effects.Process qualified as AProc
+import Atelier.Effects.Process qualified as Atelier.Process
 import Atelier.Effects.Process.Internal (RunningProcess (..))
+import Atelier.Effects.Timeout qualified as Timeout
 import Atelier.Time (Millisecond)
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.STM (newTVarIO)
-import Control.Exception (IOException, catch)
+import Control.Exception (IOException, bracket, catch)
+import Data.ByteString qualified as BS
 import Data.Char (isDigit)
 import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
+import Data.Text qualified as T
+import Data.Text.Encoding qualified as TE
 import Data.Time.Units (Second)
 import Effectful (runEff)
 import Effectful.Concurrent (runConcurrent)
 import Effectful.Exception (trySync)
 import Effectful.Writer.Static.Shared (runWriter)
-import System.IO (hGetLine)
+import GHC.IO.Encoding (mkTextEncoding)
+import System.IO (hFlush, hGetEncoding, hGetLine, hSetEncoding, utf8)
 import System.Posix.Signals (nullSignal, sigKILL, signalProcess)
+import System.Process qualified as Process
 import System.Process.Typed
-    ( createPipe
-    , getStderr
-    , getStdin
-    , getStdout
-    , setCreateGroup
-    , setStderr
-    , setStdin
-    , setStdout
-    , shell
-    , startProcess
-    , stopProcess
-    , waitExitCode
-    )
+  ( createPipe,
+    getStderr,
+    getStdin,
+    getStdout,
+    setCreateGroup,
+    setStderr,
+    setStdin,
+    setStdout,
+    shell,
+    startProcess,
+    stopProcess,
+    waitExitCode,
+  )
+import System.Timeout qualified
 import Test.Tasty (TestTree, testGroup)
 import Test.Tasty.HUnit (assertFailure, testCase, (@?), (@?=))
-
-import Atelier.Effects.Conc qualified as Conc
-import Atelier.Effects.Delay qualified as Delay
-import Atelier.Effects.File qualified as File
-import Atelier.Effects.Log qualified as Log
-import Atelier.Effects.Process qualified as AProc
-import Atelier.Effects.Process qualified as Atelier.Process
-import Atelier.Effects.Timeout qualified as Timeout
-import Data.Text qualified as T
-import System.Process qualified as Process
-import System.Timeout qualified
-
+import Tricorder.Daemon.Ghci.Config (Config (..))
 import Tricorder.Daemon.Ghci.InterruptDecision (InterruptDecision (..))
-import Tricorder.Daemon.Ghci.Process (Error (..), Process (..), UnexpectedExit (..))
-import Tricorder.Daemon.Ghci.Session.State (State (..))
-
 import Tricorder.Daemon.Ghci.InterruptDecision qualified as InterruptDecision
+import Tricorder.Daemon.Ghci.Process (Error (..), Process (..), UnexpectedExit (..))
 import Tricorder.Daemon.Ghci.Process qualified as Process
-
+import Tricorder.Daemon.Ghci.Session.State (State (..))
 
 test_Process :: TestTree
 test_Process =
-    testGroup
-        "Process"
-        [ testGroup "decideInterrupt" testDecideInterrupt
-        , testGroup "drainUntil" testDrainUntil
-        , testGroup "execGhci" testExecGhciScope
-        , testGroup "execGhci (stale marker desync)" testExecGhciStaleMarker
-        , testGroup "execGhci (sync marker scope independence)" testSyncMarkerScopeIndependent
-        , testGroup "waitForBannerOrFail" testWaitForBannerOrFail
-        , testGroup "withProcessGroup (process group)" testWithProcessGroupCleanup
-        , testGroup "terminateProcessGroup (process group)" testTerminateProcessGroup
-        ]
-
+  testGroup
+    "Process"
+    [ testGroup "decideInterrupt" testDecideInterrupt,
+      testGroup "drainUntil" testDrainUntil,
+      testGroup "execGhci" testExecGhciScope,
+      testGroup "execGhci (stale marker desync)" testExecGhciStaleMarker,
+      testGroup "execGhci (sync marker scope independence)" testSyncMarkerScopeIndependent,
+      testGroup "waitForBannerOrFail" testWaitForBannerOrFail,
+      testGroup "setupProcess (handle encodings)" testSetupProcess,
+      testGroup "withProcessGroup (process group)" testWithProcessGroupCleanup,
+      testGroup "terminateProcessGroup (process group)" testTerminateProcessGroup
+    ]
 
 -- | Mirrors the private 'markerFor' helper (not exported), using the same
 -- reconstruction as 'testExecGhciStaleMarker' below.
 finishMarker :: Int -> Text
 finishMarker n = "#~TRI-FINISH-" <> show n <> "~#"
 
-
 testDrainUntil :: [TestTree]
 testDrainUntil =
-    [ testCase "returns accumulated non-marker lines in order and stops at the marker" do
-        (r, w) <- Process.createPipe
-        (result, _msgs) <-
-            runEff
-                . runWriter @[Message]
-                . Log.runWriter
-                . File.run
-                $ do
-                    for_ ["line1", "line2", finishMarker 1, "line3"] (File.hPutTextLn w)
-                    File.hClose w
-                    Process.drainUntil r (finishMarker 1) (\_ -> pure ())
-        result @?= ["line1", "line2"]
-    , testCase "streams each non-marker line to onLine, in order, before returning" do
-        (r, w) <- Process.createPipe
-        seenRef <- newIORef []
-        (result, _msgs) <-
-            runEff
-                . runWriter @[Message]
-                . Log.runWriter
-                . File.run
-                $ do
-                    for_ ["a", "b", "c", finishMarker 2] (File.hPutTextLn w)
-                    File.hClose w
-                    Process.drainUntil r (finishMarker 2) (\l -> liftIO $ modifyIORef' seenRef (l :))
-        seen <- reverse <$> readIORef seenRef
-        seen @?= ["a", "b", "c"]
-        result @?= seen
-    , testCase "skips a stale marker with a different suffix and keeps draining" do
-        (r, w) <- Process.createPipe
-        (result, _msgs) <-
-            runEff
-                . runWriter @[Message]
-                . Log.runWriter
-                . File.run
-                $ do
-                    -- 'finishMarker 5' is a leftover from a prior, interrupted
-                    -- command; the drain waiting for 'finishMarker 9' must
-                    -- skip it rather than stopping.
-                    for_ ["before", finishMarker 5, "after", finishMarker 9] (File.hPutTextLn w)
-                    File.hClose w
-                    Process.drainUntil r (finishMarker 9) (\_ -> pure ())
-        result @?= ["before", "after"]
-    , testCase
-        "throws UnexpectedExit with ALL accumulated lines (in order) on EOF, not just the last one"
-        do
-            (r, w) <- Process.createPipe
-            (outcome, _msgs) <-
-                runEff
-                    . runWriter @[Message]
-                    . Log.runWriter
-                    . File.run
-                    $ do
-                        for_ ["first", "second", "third"] (File.hPutTextLn w)
-                        File.hClose w -- EOF before the marker ever arrives
-                        trySync (Process.drainUntil r (finishMarker 1) (\_ -> pure ()))
-            case outcome of
-                Right ls -> assertFailure ("expected UnexpectedExit, got: " <> show ls)
-                Left ex -> case fromException ex of
-                    Just (UnexpectedExit (MkUnexpectedExit m ls)) -> do
-                        m @?= finishMarker 1
-                        ls
-                            @?= "Reached EOF before reading marker from GHCi.\nWas looking for marker '#~TRI-FINISH-1~#', but no such marker was found.\nAccumulated output from GHCi so far:\nfirst\nsecond\nthird"
-                    other -> assertFailure ("expected UnexpectedExit, got: " <> show other)
-    , testCase "throws UnexpectedExit with no lines when EOF is reached immediately" do
+  [ testCase "returns accumulated non-marker lines in order and stops at the marker" do
+      (r, w) <- Process.createPipe
+      (result, _msgs) <-
+        runEff
+          . runWriter @[Message]
+          . Log.runWriter
+          . File.run
+          $ do
+            for_ ["line1", "line2", finishMarker 1, "line3"] (File.hPutTextLn w)
+            File.hClose w
+            Process.drainUntil r (finishMarker 1) (\_ -> pure ())
+      result @?= ["line1", "line2"],
+    testCase "streams each non-marker line to onLine, in order, before returning" do
+      (r, w) <- Process.createPipe
+      seenRef <- newIORef []
+      (result, _msgs) <-
+        runEff
+          . runWriter @[Message]
+          . Log.runWriter
+          . File.run
+          $ do
+            for_ ["a", "b", "c", finishMarker 2] (File.hPutTextLn w)
+            File.hClose w
+            Process.drainUntil r (finishMarker 2) (\l -> liftIO $ modifyIORef' seenRef (l :))
+      seen <- reverse <$> readIORef seenRef
+      seen @?= ["a", "b", "c"]
+      result @?= seen,
+    testCase "skips a stale marker with a different suffix and keeps draining" do
+      (r, w) <- Process.createPipe
+      (result, _msgs) <-
+        runEff
+          . runWriter @[Message]
+          . Log.runWriter
+          . File.run
+          $ do
+            -- 'finishMarker 5' is a leftover from a prior, interrupted
+            -- command; the drain waiting for 'finishMarker 9' must
+            -- skip it rather than stopping.
+            for_ ["before", finishMarker 5, "after", finishMarker 9] (File.hPutTextLn w)
+            File.hClose w
+            Process.drainUntil r (finishMarker 9) (\_ -> pure ())
+      result @?= ["before", "after"],
+    testCase
+      "throws UnexpectedExit with ALL accumulated lines (in order) on EOF, not just the last one"
+      do
         (r, w) <- Process.createPipe
         (outcome, _msgs) <-
-            runEff
-                . runWriter @[Message]
-                . Log.runWriter
-                . File.run
-                $ do
-                    File.hClose w
-                    trySync (Process.drainUntil r (finishMarker 1) (\_ -> pure ()))
+          runEff
+            . runWriter @[Message]
+            . Log.runWriter
+            . File.run
+            $ do
+              for_ ["first", "second", "third"] (File.hPutTextLn w)
+              File.hClose w -- EOF before the marker ever arrives
+              trySync (Process.drainUntil r (finishMarker 1) (\_ -> pure ()))
         case outcome of
-            Right ls -> assertFailure ("expected UnexpectedExit, got: " <> show ls)
-            Left ex -> case fromException ex of
-                Just (UnexpectedExit (MkUnexpectedExit m ls)) -> do
-                    m @?= finishMarker 1
-                    let expected =
-                            "Reached EOF before reading marker from GHCi.\nWas looking for marker '#~TRI-FINISH-1~#', but no such marker was found.\nGHCi returned no output before we reached what we believe is EOF.\nGot the following exception when attempting to read from GHCi:\n<file descriptor:"
-                    (expected `T.isPrefixOf` ls)
-                        @? ( "error message does not start with expected prefix\nExpected:\n"
-                                <> show expected
-                                <> "\nActual:\n"
-                                <> show ls
-                           )
-                other -> assertFailure ("expected UnexpectedExit, got: " <> show other)
-    , testCase
-        "logs an ERROR mentioning the missing marker and the exception when EOF is reached with no output"
-        do
-            (r, w) <- Process.createPipe
-            (_outcome, msgs) <-
-                runEff
-                    . runWriter @[Message]
-                    . Log.runWriter
-                    . File.run
-                    $ do
-                        File.hClose w
-                        trySync (Process.drainUntil r (finishMarker 3) (\_ -> pure ()))
-            case filter (\m -> m.severity == ERROR) msgs of
-                [] -> assertFailure "expected an ERROR log message"
-                (logMsg : _) -> do
-                    (finishMarker 3 `T.isInfixOf` logMsg.text) @?= True
-                    ("GHCi returned no output" `T.isInfixOf` logMsg.text) @?= True
-    , testCase "logs an ERROR including the accumulated output when EOF is reached mid-output" do
+          Right ls -> assertFailure ("expected UnexpectedExit, got: " <> show ls)
+          Left ex -> case fromException ex of
+            Just (UnexpectedExit (MkUnexpectedExit m ls)) -> do
+              m @?= finishMarker 1
+              ls
+                @?= "Reached EOF before reading marker from GHCi.\nWas looking for marker '#~TRI-FINISH-1~#', but no such marker was found.\nAccumulated output from GHCi so far:\nfirst\nsecond\nthird"
+            other -> assertFailure ("expected UnexpectedExit, got: " <> show other),
+    testCase "throws UnexpectedExit with no lines when EOF is reached immediately" do
+      (r, w) <- Process.createPipe
+      (outcome, _msgs) <-
+        runEff
+          . runWriter @[Message]
+          . Log.runWriter
+          . File.run
+          $ do
+            File.hClose w
+            trySync (Process.drainUntil r (finishMarker 1) (\_ -> pure ()))
+      case outcome of
+        Right ls -> assertFailure ("expected UnexpectedExit, got: " <> show ls)
+        Left ex -> case fromException ex of
+          Just (UnexpectedExit (MkUnexpectedExit m ls)) -> do
+            m @?= finishMarker 1
+            let expected =
+                  "Reached EOF before reading marker from GHCi.\nWas looking for marker '#~TRI-FINISH-1~#', but no such marker was found.\nGHCi returned no output before we reached what we believe is EOF.\nGot the following exception when attempting to read from GHCi:\n<file descriptor:"
+            (expected `T.isPrefixOf` ls)
+              @? ( "error message does not start with expected prefix\nExpected:\n"
+                     <> show expected
+                     <> "\nActual:\n"
+                     <> show ls
+                 )
+          other -> assertFailure ("expected UnexpectedExit, got: " <> show other),
+    testCase
+      "logs an ERROR mentioning the missing marker and the exception when EOF is reached with no output"
+      do
         (r, w) <- Process.createPipe
         (_outcome, msgs) <-
-            runEff
-                . runWriter @[Message]
-                . Log.runWriter
-                . File.run
-                $ do
-                    for_ ["oops-line-1", "oops-line-2"] (File.hPutTextLn w)
-                    File.hClose w
-                    trySync (Process.drainUntil r (finishMarker 4) (\_ -> pure ()))
+          runEff
+            . runWriter @[Message]
+            . Log.runWriter
+            . File.run
+            $ do
+              File.hClose w
+              trySync (Process.drainUntil r (finishMarker 3) (\_ -> pure ()))
         case filter (\m -> m.severity == ERROR) msgs of
-            [] -> assertFailure "expected an ERROR log message"
-            (logMsg : _) -> do
-                (finishMarker 4 `T.isInfixOf` logMsg.text) @?= True
-                ("oops-line-1" `T.isInfixOf` logMsg.text) @?= True
-                ("oops-line-2" `T.isInfixOf` logMsg.text) @?= True
-    ]
-
+          [] -> assertFailure "expected an ERROR log message"
+          (logMsg : _) -> do
+            (finishMarker 3 `T.isInfixOf` logMsg.text) @?= True
+            ("GHCi returned no output" `T.isInfixOf` logMsg.text) @?= True,
+    testCase "logs an ERROR including the accumulated output when EOF is reached mid-output" do
+      (r, w) <- Process.createPipe
+      (_outcome, msgs) <-
+        runEff
+          . runWriter @[Message]
+          . Log.runWriter
+          . File.run
+          $ do
+            for_ ["oops-line-1", "oops-line-2"] (File.hPutTextLn w)
+            File.hClose w
+            trySync (Process.drainUntil r (finishMarker 4) (\_ -> pure ()))
+      case filter (\m -> m.severity == ERROR) msgs of
+        [] -> assertFailure "expected an ERROR log message"
+        (logMsg : _) -> do
+          (finishMarker 4 `T.isInfixOf` logMsg.text) @?= True
+          ("oops-line-1" `T.isInfixOf` logMsg.text) @?= True
+          ("oops-line-2" `T.isInfixOf` logMsg.text) @?= True
+  ]
 
 -- | Regression for the touch-during-reload desync. Interrupting a *Busy* GHCi
 -- (a reload in flight) leaves a stale sync marker in the stdout/stderr buffers
@@ -208,54 +206,53 @@ testDrainUntil =
 -- own and stop only on the marker it is waiting for.
 testExecGhciStaleMarker :: [TestTree]
 testExecGhciStaleMarker =
-    [ testCase "skips a stale leftover marker and returns the command's real output" do
-        (stdinR, stdinW) <- Process.createPipe
-        (stdoutR, stdoutW) <- Process.createPipe
-        (stderrR, stderrW) <- Process.createPipe
-        -- A dummy process handle to fill the record; 'execGhci' never uses it.
-        p <-
-            startProcess
-                $ setStdin createPipe
-                $ setStdout createPipe
-                $ setStderr createPipe
-                $ shell "true"
-        _ <- waitExitCode p
-        stateVar <- newTVarIO (Idle 9)
-        let gp =
-                Process
-                    { stdin = stdinW
-                    , stdout = stdoutR
-                    , stderr = stderrR
-                    , handle = RunningProcess p
-                    , stateVar
-                    }
-            -- Mirrors 'markerFor': "#~TRI-FINISH-<n>~#".
-            marker n = "#~TRI-FINISH-" <> show (n :: Int) <> "~#" :: Text
-        result <-
-            runEff
-                . runConcurrent
-                . Timeout.run
-                . Delay.runIO
-                . File.run
-                . Log.runNoOp
-                . Conc.runIO
-                $ do
-                    -- A stale 'marker 5' (left by a prior interrupted reload)
-                    -- precedes the fresh command's real output + its 'marker 9'
-                    -- (state is 'Idle 9', so 'execGhci' waits for marker 9).
-                    for_ [marker 5, "out-line", marker 9] (File.hPutTextLn stdoutW)
-                    for_ [marker 5, "err-line", marker 9] (File.hPutTextLn stderrW)
-                    File.hClose stdoutW
-                    File.hClose stderrW
-                    -- Keep the stdin read-end alive across the write inside
-                    -- 'execGhci' (otherwise it is GC-finalised → broken pipe).
-                    r <- Process.exec gp "reload" (\_ -> pure ())
-                    File.hClose stdinR
-                    pure r
-        _ <- (Right <$> stopProcess p) `catch` \(_ :: SomeException) -> pure (Left ())
-        result @?= ["out-line", "err-line"]
-    ]
-
+  [ testCase "skips a stale leftover marker and returns the command's real output" do
+      (stdinR, stdinW) <- Process.createPipe
+      (stdoutR, stdoutW) <- Process.createPipe
+      (stderrR, stderrW) <- Process.createPipe
+      -- A dummy process handle to fill the record; 'execGhci' never uses it.
+      p <-
+        startProcess $
+          setStdin createPipe $
+            setStdout createPipe $
+              setStderr createPipe $
+                shell "true"
+      _ <- waitExitCode p
+      stateVar <- newTVarIO (Idle 9)
+      let gp =
+            Process
+              { stdin = stdinW,
+                stdout = stdoutR,
+                stderr = stderrR,
+                handle = RunningProcess p,
+                stateVar
+              }
+          -- Mirrors 'markerFor': "#~TRI-FINISH-<n>~#".
+          marker n = "#~TRI-FINISH-" <> show (n :: Int) <> "~#" :: Text
+      result <-
+        runEff
+          . runConcurrent
+          . Timeout.run
+          . Delay.runIO
+          . File.run
+          . Log.runNoOp
+          . Conc.runIO
+          $ do
+            -- A stale 'marker 5' (left by a prior interrupted reload)
+            -- precedes the fresh command's real output + its 'marker 9'
+            -- (state is 'Idle 9', so 'execGhci' waits for marker 9).
+            for_ [marker 5, "out-line", marker 9] (File.hPutTextLn stdoutW)
+            for_ [marker 5, "err-line", marker 9] (File.hPutTextLn stderrW)
+            File.hClose stdoutW
+            File.hClose stderrW
+            -- Keep the stdin read-end alive across the write inside
+            -- 'execGhci' (otherwise it is GC-finalised → broken pipe).
+            r <- Process.exec gp "reload" (\_ -> pure ())
+            File.hClose stdinR
+            pure r
+      _ <- (Right <$> stopProcess p) `catch` \(_ :: SomeException) -> pure (Left ())
+      result @?= ["out-line", "err-line"]
+  ]
 
 -- | Root-cause regression for the "stuck Building…" stall. A SIGINT-interrupted
 -- ':reload' empties GHCi's interactive scope — it drops the implicit
@@ -269,56 +266,55 @@ testExecGhciStaleMarker =
 -- We assert on exactly what 'execGhci' writes to GHCi's stdin.
 testSyncMarkerScopeIndependent :: [TestTree]
 testSyncMarkerScopeIndependent =
-    [ testCase "writes the finish marker using only fully-qualified names (no bare putStrLn / >>)" do
-        (stdinR, stdinW) <- Process.createPipe
-        (stdoutR, stdoutW) <- Process.createPipe
-        (stderrR, stderrW) <- Process.createPipe
-        p <-
-            startProcess
-                $ setStdin createPipe
-                $ setStdout createPipe
-                $ setStderr createPipe
-                $ shell "true"
-        _ <- waitExitCode p
-        stateVar <- newTVarIO (Idle 9)
-        let gp =
-                Process
-                    { stdin = stdinW
-                    , stdout = stdoutR
-                    , stderr = stderrR
-                    , handle = RunningProcess p
-                    , stateVar
-                    }
-            marker = "#~TRI-FINISH-9~#" :: Text
-        written <-
-            runEff
-                . runConcurrent
-                . Timeout.run
-                . Delay.runIO
-                . File.run
-                . Log.runNoOp
-                . Conc.runIO
-                $ do
-                    -- Pre-seed the marker on both streams so the drain returns
-                    -- immediately; we only care about what was written to stdin.
-                    File.hPutTextLn stdoutW marker
-                    File.hPutTextLn stderrW marker
-                    File.hClose stdoutW
-                    File.hClose stderrW
-                    _ <- Process.exec gp ":reload" (\_ -> pure ())
-                    File.hClose stdinW
-                    let readAll acc =
-                            trySync (File.hGetLine stdinR) >>= \case
-                                Left (_ :: SomeException) -> pure (reverse acc)
-                                Right l -> readAll (l : acc)
-                    readAll []
-        _ <- (Right <$> stopProcess p) `catch` \(_ :: SomeException) -> pure (Left ())
-        let blob = T.intercalate "\n" written
-        (" >> " `T.isInfixOf` blob) @?= False
-        ("System.IO.hPutStrLn System.IO.stdout" `T.isInfixOf` blob) @?= True
-        ("System.IO.hPutStrLn System.IO.stderr" `T.isInfixOf` blob) @?= True
-    ]
-
+  [ testCase "writes the finish marker using only fully-qualified names (no bare putStrLn / >>)" do
+      (stdinR, stdinW) <- Process.createPipe
+      (stdoutR, stdoutW) <- Process.createPipe
+      (stderrR, stderrW) <- Process.createPipe
+      p <-
+        startProcess $
+          setStdin createPipe $
+            setStdout createPipe $
+              setStderr createPipe $
+                shell "true"
+      _ <- waitExitCode p
+      stateVar <- newTVarIO (Idle 9)
+      let gp =
+            Process
+              { stdin = stdinW,
+                stdout = stdoutR,
+                stderr = stderrR,
+                handle = RunningProcess p,
+                stateVar
+              }
+          marker = "#~TRI-FINISH-9~#" :: Text
+      written <-
+        runEff
+          . runConcurrent
+          . Timeout.run
+          . Delay.runIO
+          . File.run
+          . Log.runNoOp
+          . Conc.runIO
+          $ do
+            -- Pre-seed the marker on both streams so the drain returns
+            -- immediately; we only care about what was written to stdin.
+            File.hPutTextLn stdoutW marker
+            File.hPutTextLn stderrW marker
+            File.hClose stdoutW
+            File.hClose stderrW
+            _ <- Process.exec gp ":reload" (\_ -> pure ())
+            File.hClose stdinW
+            let readAll acc =
+                  trySync (File.hGetLine stdinR) >>= \case
+                    Left (_ :: SomeException) -> pure (reverse acc)
+                    Right l -> readAll (l : acc)
+            readAll []
+      _ <- (Right <$> stopProcess p) `catch` \(_ :: SomeException) -> pure (Left ())
+      let blob = T.intercalate "\n" written
+      (" >> " `T.isInfixOf` blob) @?= False
+      ("System.IO.hPutStrLn System.IO.stdout" `T.isInfixOf` blob) @?= True
+      ("System.IO.hPutStrLn System.IO.stderr" `T.isInfixOf` blob) @?= True
+  ]
 
 -- | Regression: when the build command exits before printing a GHCi banner,
 -- 'waitForBannerOrFail' must surface the *complete* stderr output in the
@@ -328,44 +324,92 @@ testSyncMarkerScopeIndependent =
 -- the pipe was truncated, and the real cabal/build failure was lost.
 testWaitForBannerOrFail :: [TestTree]
 testWaitForBannerOrFail =
-    [ testCase "captures the full stderr output when the command exits before the banner" do
-        let lineCount = 200 :: Int
-            lastLine = "err line " <> show lineCount
-        -- The banner and error streams are pipes we drive ourselves, so the
-        -- timing is deterministic rather than a race against the OS pipe buffer.
-        (bannerOut, bannerOutW) <- Process.createPipe
-        (errR, errW) <- Process.createPipe
-        result <-
-            runEff
-                . runConcurrent
-                . Timeout.run
-                . Delay.runIO
-                . File.run
-                . Conc.runIO
-                $ do
-                    -- No banner will ever arrive: close the write end so the
-                    -- wait sees EOF at once and takes the "command exited"
-                    -- failure branch.
-                    File.hClose bannerOutW
-                    -- Producer: pause long enough that a snapshot-at-exit reads
-                    -- an empty buffer, THEN stream the whole error log and
-                    -- close so the drain sees EOF. A correct implementation
-                    -- awaits that drain before reading the captured lines.
-                    _ <- Conc.fork do
-                        Delay.wait (30 :: Millisecond)
-                        for_ [1 .. lineCount] \i ->
-                            File.hPutTextLn errW ("err line " <> show i :: Text)
-                        File.hClose errW
-                    trySync (Process.waitForBannerOrFail (5 :: Second) bannerOut errR)
-        case result of
-            Right () -> assertFailure "expected waitForBannerOrFail to throw a startup error"
-            Left ex -> case fromException ex of
-                Just (StartupFailed msg) ->
-                    (lastLine `T.isInfixOf` msg) @?= True
-                other ->
-                    assertFailure ("expected StartupFailed, got: " <> show other)
-    ]
+  [ testCase "captures the full stderr output when the command exits before the banner" do
+      let lineCount = 200 :: Int
+          lastLine = "err line " <> show lineCount
+      -- The banner and error streams are pipes we drive ourselves, so the
+      -- timing is deterministic rather than a race against the OS pipe buffer.
+      (bannerOut, bannerOutW) <- Process.createPipe
+      (errR, errW) <- Process.createPipe
+      result <-
+        runEff
+          . runConcurrent
+          . Timeout.run
+          . Delay.runIO
+          . File.run
+          . Conc.runIO
+          $ do
+            -- No banner will ever arrive: close the write end so the
+            -- wait sees EOF at once and takes the "command exited"
+            -- failure branch.
+            File.hClose bannerOutW
+            -- Producer: pause long enough that a snapshot-at-exit reads
+            -- an empty buffer, THEN stream the whole error log and
+            -- close so the drain sees EOF. A correct implementation
+            -- awaits that drain before reading the captured lines.
+            _ <- Conc.fork do
+              Delay.wait (30 :: Millisecond)
+              for_ [1 .. lineCount] \i ->
+                File.hPutTextLn errW ("err line " <> show i :: Text)
+              File.hClose errW
+            trySync (Process.waitForBannerOrFail (5 :: Second) bannerOut errR)
+      case result of
+        Right () -> assertFailure "expected waitForBannerOrFail to throw a startup error"
+        Left ex -> case fromException ex of
+          Just (StartupFailed msg) ->
+            (lastLine `T.isInfixOf` msg) @?= True
+          other ->
+            assertFailure ("expected StartupFailed, got: " <> show other)
+  ]
 
+-- | Regression: the GHCi pipe handles must encode/decode UTF-8 regardless of
+-- the ambient locale. Under a C/ASCII locale, non-ASCII GHCi output (e.g. an
+-- em-dash in a message) used to blow up the daemon when decoded through the
+-- locale encoding.
+testSetupProcess :: [TestTree]
+testSetupProcess =
+  [ testCase "pins the pipe handles to UTF-8 regardless of locale encoding" do
+      outcome <- System.Timeout.timeout (8_000_000) do
+        bracket startTee stopProcess \p -> do
+          -- Simulate handles created under a C/ASCII locale.
+          asciiEnc <- mkTextEncoding "ASCII"
+          mapM_ (\h -> hSetEncoding h asciiEnc) [getStdin p, getStdout p, getStderr p]
+          -- What a UTF-8-speaking GHCi emits: raw UTF-8 bytes — the
+          -- version banner, then a line with an em-dash.
+          -- @tee /dev/stderr@ echoes everything to both streams, so its
+          -- echo of the sync statement (written by 'setupProcess' after
+          -- the banner) acts as the finish marker on each of them.
+          BS.hPut (getStdin p) (TE.encodeUtf8 ("GHCi, version 9.12.4\n\8212\n" :: Text))
+          hFlush (getStdin p)
+          runEff
+            . runConcurrent
+            . Timeout.run
+            . Delay.runIO
+            . File.run
+            . Log.runNoOp
+            . Conc.runIO
+            $ trySync (Process.setupProcess testConfig (RunningProcess p) (\_ -> pure ()) (\_ -> pure ()))
+      case outcome of
+        Nothing -> assertFailure "timed out"
+        Just (Left ex) -> assertFailure ("setupProcess crashed: " <> show ex)
+        Just (Right (gp, initialLines)) -> do
+          ("\8212" `elem` initialLines)
+            @? ("em-dash output line missing from " <> show initialLines)
+          mapM_ (\h -> (fmap show <$> hGetEncoding h) >>= (@?= Just (show utf8))) [gp.stdin, gp.stdout, gp.stderr]
+  ]
+  where
+    startTee =
+      startProcess $
+        setStdin createPipe $
+          setStdout createPipe $
+            setStderr createPipe $
+              shell "tee /dev/stderr"
+    testConfig =
+      Config
+        { startupTimeout = 5,
+          shutdownTimeout = 5,
+          extraSetupCommands = []
+        }
 
 -- | Regression for orphaned/zombie build subprocesses on restart and shutdown.
 --
@@ -377,85 +421,81 @@ testWaitForBannerOrFail =
 -- returns, the child must be gone.
 testWithProcessGroupCleanup :: [TestTree]
 testWithProcessGroupCleanup =
-    [ testCase "terminates the whole group on exit, even after the leader has exited" do
-        childPidRef <- newIORef (Nothing :: Maybe Int)
-        let scenario =
-                runEff
-                    . runConcurrent
-                    . Timeout.run
-                    . Delay.runIO
-                    . File.run
-                    . Conc.runIO
-                    . Atelier.Process.run
-                    $ withProcessGroup procConfig \p -> do
-                        -- First stdout line is the long-lived child's pid.
-                        line <- File.hGetLine (AProc.getStdout p)
-                        liftIO $ writeIORef childPidRef (parsePid (T.unpack line))
-                        -- Let the leader exit and reap it, so the cleanup runs
-                        -- with the leader already gone — the path the bug needed.
-                        File.hPutTextLn (AProc.getStdin p) ""
-                        File.hFlush (AProc.getStdin p)
-                        void $ AProc.waitExitCode p
-        -- Hard wall-clock bound: a regression must surface as a failed
-        -- assertion, never as a hang that stalls the whole suite.
-        outcome <- System.Timeout.timeout (8_000_000) scenario
-        case outcome of
-            Nothing -> assertFailure "test timed out (process did not settle)"
-            Just () ->
-                readIORef childPidRef >>= \case
-                    Nothing -> assertFailure "could not capture the child pid"
-                    Just childPid -> do
-                        died <- waitForProcessDeath childPid
-                        -- Never leak the child if the assertion fails.
-                        ignoring (signalProcess sigKILL (fromIntegral childPid))
-                        died @?= True
-    ]
+  [ testCase "terminates the whole group on exit, even after the leader has exited" do
+      childPidRef <- newIORef (Nothing :: Maybe Int)
+      let scenario =
+            runEff
+              . runConcurrent
+              . Timeout.run
+              . Delay.runIO
+              . File.run
+              . Conc.runIO
+              . Atelier.Process.run
+              $ withProcessGroup procConfig \p -> do
+                -- First stdout line is the long-lived child's pid.
+                line <- File.hGetLine (AProc.getStdout p)
+                liftIO $ writeIORef childPidRef (parsePid (T.unpack line))
+                -- Let the leader exit and reap it, so the cleanup runs
+                -- with the leader already gone — the path the bug needed.
+                File.hPutTextLn (AProc.getStdin p) ""
+                File.hFlush (AProc.getStdin p)
+                void $ AProc.waitExitCode p
+      -- Hard wall-clock bound: a regression must surface as a failed
+      -- assertion, never as a hang that stalls the whole suite.
+      outcome <- System.Timeout.timeout (8_000_000) scenario
+      case outcome of
+        Nothing -> assertFailure "test timed out (process did not settle)"
+        Just () ->
+          readIORef childPidRef >>= \case
+            Nothing -> assertFailure "could not capture the child pid"
+            Just childPid -> do
+              died <- waitForProcessDeath childPid
+              -- Never leak the child if the assertion fails.
+              ignoring (signalProcess sigKILL (fromIntegral childPid))
+              died @?= True
+  ]
   where
     procConfig =
-        setStdin createPipe
-            $ setStdout createPipe
-            $ setStderr createPipe
-            $ shell "sleep 30 & echo \"$!\"; read _quit"
-
+      setStdin createPipe $
+        setStdout createPipe $
+          setStderr createPipe $
+            shell "sleep 30 & echo \"$!\"; read _quit"
 
 -- | 'terminateProcessGroup' must kill the whole group when called mid-flight
 -- (the leader still alive) — the explicit early-termination path the test
 -- runner uses to abort a one-shot @cabal repl test:…@ from another thread.
 testTerminateProcessGroup :: [TestTree]
 testTerminateProcessGroup =
-    [ testCase "kills the whole group, not just the leader, mid-flight" do
-        outcome <- System.Timeout.timeout (8_000_000) do
-            p <-
-                startProcess
-                    $ setStdin createPipe
-                    $ setStdout createPipe
-                    $ setStderr createPipe
-                    $ setCreateGroup True
-                    $ shell "sleep 30 & echo \"$!\"; read _quit"
-            childLine <- hGetLine (getStdout p)
-            case parsePid childLine of
-                Nothing -> do
-                    ignoring (stopProcess p)
-                    assertFailure ("could not parse child pid from: " <> show childLine)
-                Just childPid -> do
-                    runEff . Atelier.Process.run $ terminateProcessGroup (RunningProcess p)
-                    died <- waitForProcessDeath childPid
-                    -- Never leak the child if the assertion fails.
-                    ignoring (signalProcess sigKILL (fromIntegral childPid))
-                    pure died
-        outcome @?= Just True
-    ]
-
+  [ testCase "kills the whole group, not just the leader, mid-flight" do
+      outcome <- System.Timeout.timeout (8_000_000) do
+        p <-
+          startProcess $
+            setStdin createPipe $
+              setStdout createPipe $
+                setStderr createPipe $
+                  setCreateGroup True $
+                    shell "sleep 30 & echo \"$!\"; read _quit"
+        childLine <- hGetLine (getStdout p)
+        case parsePid childLine of
+          Nothing -> do
+            ignoring (stopProcess p)
+            assertFailure ("could not parse child pid from: " <> show childLine)
+          Just childPid -> do
+            runEff . Atelier.Process.run $ terminateProcessGroup (RunningProcess p)
+            died <- waitForProcessDeath childPid
+            -- Never leak the child if the assertion fails.
+            ignoring (signalProcess sigKILL (fromIntegral childPid))
+            pure died
+      outcome @?= Just True
+  ]
 
 -- | Parse a pid printed on its own line (tolerating surrounding whitespace).
 parsePid :: String -> Maybe Int
 parsePid = readMaybe . takeWhile isDigit . dropWhile (not . isDigit)
 
-
 -- | Swallow any exception from a best-effort cleanup action.
 ignoring :: IO () -> IO ()
 ignoring act = act `catch` \(_ :: SomeException) -> pure ()
-
 
 -- | Poll for up to ~3s for the given pid to disappear from the process table.
 -- @signalProcess nullSignal@ is a liveness probe: it throws once the process is
@@ -465,30 +505,28 @@ waitForProcessDeath pid = go (60 :: Int)
   where
     go 0 = not <$> alive
     go n = do
-        a <- alive
-        if not a then pure True else threadDelay 50_000 >> go (n - 1)
+      a <- alive
+      if not a then pure True else threadDelay 50_000 >> go (n - 1)
     alive =
-        (signalProcess nullSignal (fromIntegral pid) >> pure True)
-            `catch` \(_ :: IOException) -> pure False
-
+      (signalProcess nullSignal (fromIntegral pid) >> pure True)
+        `catch` \(_ :: IOException) -> pure False
 
 testDecideInterrupt :: [TestTree]
 testDecideInterrupt =
-    -- Regression: an idle GHCi must not be SIGINT'd, since the matching
-    -- sync-marker write would leave a stale marker line in stdout/stderr
-    -- that the next 'execGhci' drain would match instead of the fresh one,
-    -- desyncing the protocol and reporting "0 modules" or hanging.
-    [ testCase "is a no-op when the session is Idle" do
-        InterruptDecision.decide (Idle 7) @?= (Idle 7, NoOpIdle)
-    , testCase "preserves the counter for any Idle state" do
-        InterruptDecision.decide (Idle 0) @?= (Idle 0, NoOpIdle)
-        InterruptDecision.decide (Idle 42) @?= (Idle 42, NoOpIdle)
-    , testCase "advances to Idle (n+1) and emits SendInterruptFor n when Busy" do
-        InterruptDecision.decide (Busy 7) @?= (Idle 8, SendInterruptFor 7)
-    , testCase "advances correctly from Busy 0" do
-        InterruptDecision.decide (Busy 0) @?= (Idle 1, SendInterruptFor 0)
-    ]
-
+  -- Regression: an idle GHCi must not be SIGINT'd, since the matching
+  -- sync-marker write would leave a stale marker line in stdout/stderr
+  -- that the next 'execGhci' drain would match instead of the fresh one,
+  -- desyncing the protocol and reporting "0 modules" or hanging.
+  [ testCase "is a no-op when the session is Idle" do
+      InterruptDecision.decide (Idle 7) @?= (Idle 7, NoOpIdle),
+    testCase "preserves the counter for any Idle state" do
+      InterruptDecision.decide (Idle 0) @?= (Idle 0, NoOpIdle)
+      InterruptDecision.decide (Idle 42) @?= (Idle 42, NoOpIdle),
+    testCase "advances to Idle (n+1) and emits SendInterruptFor n when Busy" do
+      InterruptDecision.decide (Busy 7) @?= (Idle 8, SendInterruptFor 7),
+    testCase "advances correctly from Busy 0" do
+      InterruptDecision.decide (Busy 0) @?= (Idle 1, SendInterruptFor 0)
+  ]
 
 -- | Pins down the 'Conc.scoped' fix in 'execGhci': when the drain forks
 -- raise 'UnexpectedExit' (because the underlying process exited and EOF'd
@@ -504,60 +542,60 @@ testDecideInterrupt =
 -- the user observed.
 testExecGhciScope :: [TestTree]
 testExecGhciScope =
-    -- Spawn a real subprocess that exits immediately ('true'). Its
-    -- stdout/stderr pipes EOF as soon as the child exits, which makes
-    -- 'drainUntil' inside 'execGhci' throw 'UnexpectedExit' — exactly the
-    -- mid-command termination path the fix exists to handle.
-    [ testCase "contains drain exceptions inside its own scope so siblings survive" do
-        p <-
-            startProcess
-                $ setStdin createPipe
-                $ setStdout createPipe
-                $ setStderr createPipe
-                $ shell "true"
-        -- Wait for the child to actually exit so the pipes are EOF before
-        -- 'execGhci' starts draining (otherwise the drain blocks).
-        _ <- waitExitCode p
-        stateVar <- newTVarIO (Idle 0)
-        let gp =
-                Process
-                    { stdin = getStdin p
-                    , stdout = getStdout p
-                    , stderr = getStderr p
-                    , handle = RunningProcess p
-                    , stateVar
-                    }
-        siblingDoneRef <- newIORef False
-        result <-
-            runEff
-                . runConcurrent
-                . Timeout.run
-                . Delay.runIO
-                . File.run
-                . Log.runNoOp
-                . Conc.runIO
-                $ Conc.scoped do
-                    -- A sibling fork in the SAME ambient scope. If the bug
-                    -- regresses, the drain exception will tear this scope
-                    -- down and the sibling will be cancelled before it can
-                    -- flip the ref.
-                    sibling <- Conc.fork do
-                        Delay.wait (50 :: Millisecond)
-                        liftIO (writeIORef siblingDoneRef True)
-                    -- Drive 'execGhci' on a dead process; the drains should
-                    -- raise 'UnexpectedExit', which 'trySync' must catch
-                    -- here rather than letting Ki tear down the scope.
-                    execResult <- trySync (Process.exec gp "cmd" (\_ -> pure ()))
-                    -- Wait for the sibling to run.
-                    Conc.await sibling
-                    pure execResult
-        -- stopProcess flushes the buffered command+marker to a pipe whose
-        -- read end is already closed, which raises ResourceVanished. The
-        -- subprocess has long since exited; just swallow the cleanup error.
-        _ <- (Right <$> stopProcess p) `catch` \(_ :: SomeException) -> pure (Left ())
-        siblingDone <- readIORef siblingDoneRef
-        siblingDone @?= True
-        case result of
-            Right _ -> assertFailure "expected execGhci to raise UnexpectedExit"
-            Left _ -> pure ()
-    ]
+  -- Spawn a real subprocess that exits immediately ('true'). Its
+  -- stdout/stderr pipes EOF as soon as the child exits, which makes
+  -- 'drainUntil' inside 'execGhci' throw 'UnexpectedExit' — exactly the
+  -- mid-command termination path the fix exists to handle.
+  [ testCase "contains drain exceptions inside its own scope so siblings survive" do
+      p <-
+        startProcess $
+          setStdin createPipe $
+            setStdout createPipe $
+              setStderr createPipe $
+                shell "true"
+      -- Wait for the child to actually exit so the pipes are EOF before
+      -- 'execGhci' starts draining (otherwise the drain blocks).
+      _ <- waitExitCode p
+      stateVar <- newTVarIO (Idle 0)
+      let gp =
+            Process
+              { stdin = getStdin p,
+                stdout = getStdout p,
+                stderr = getStderr p,
+                handle = RunningProcess p,
+                stateVar
+              }
+      siblingDoneRef <- newIORef False
+      result <-
+        runEff
+          . runConcurrent
+          . Timeout.run
+          . Delay.runIO
+          . File.run
+          . Log.runNoOp
+          . Conc.runIO
+          $ Conc.scoped do
+            -- A sibling fork in the SAME ambient scope. If the bug
+            -- regresses, the drain exception will tear this scope
+            -- down and the sibling will be cancelled before it can
+            -- flip the ref.
+            sibling <- Conc.fork do
+              Delay.wait (50 :: Millisecond)
+              liftIO (writeIORef siblingDoneRef True)
+            -- Drive 'execGhci' on a dead process; the drains should
+            -- raise 'UnexpectedExit', which 'trySync' must catch
+            -- here rather than letting Ki tear down the scope.
+            execResult <- trySync (Process.exec gp "cmd" (\_ -> pure ()))
+            -- Wait for the sibling to run.
+            Conc.await sibling
+            pure execResult
+      -- stopProcess flushes the buffered command+marker to a pipe whose
+      -- read end is already closed, which raises ResourceVanished. The
+      -- subprocess has long since exited; just swallow the cleanup error.
+      _ <- (Right <$> stopProcess p) `catch` \(_ :: SomeException) -> pure (Left ())
+      siblingDone <- readIORef siblingDoneRef
+      siblingDone @?= True
+      case result of
+        Right _ -> assertFailure "expected execGhci to raise UnexpectedExit"
+        Left _ -> pure ()
+  ]

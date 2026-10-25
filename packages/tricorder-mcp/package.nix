@@ -96,6 +96,7 @@ in
       ++ depList [
         "atelier-core"
         "atelier-prelude"
+        "directory"
         "tasty"
         "tasty-hunit"
       ];

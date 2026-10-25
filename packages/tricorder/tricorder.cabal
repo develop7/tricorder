@@ -294,6 +294,7 @@ test-suite tricorder-test
       Unit.Tricorder.Build.ByteSizeSpec
       Unit.Tricorder.Build.EvalCommentSpec
       Unit.Tricorder.CLI.App.Test.SuiteViewSpec
+      Unit.Tricorder.CLI.MainSpec
       Unit.Tricorder.CLI.RenderSpec
       Unit.Tricorder.Daemon.BuilderSpec
       Unit.Tricorder.Daemon.BuildStateSpec
