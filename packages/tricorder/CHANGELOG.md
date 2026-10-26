@@ -7,6 +7,12 @@ and this project adheres to the [PVP](https://pvp.haskell.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Prevent CLI help and diagnostics, daemon output, and GHCi pipe communication
+  from failing on non-ASCII text under non-UTF-8 locales by using UTF-8.
+  Non-breaking.
+
 ## [0.7.0.0] - 2026-10-23
 
 ### Added

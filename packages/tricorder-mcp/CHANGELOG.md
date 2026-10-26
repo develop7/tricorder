@@ -7,6 +7,11 @@ and this project adheres to the [PVP](https://pvp.haskell.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Decode standard-input requests as UTF-8 so non-ASCII JSON-RPC requests work
+  under non-UTF-8 locales. Non-breaking.
+
 ## [0.2.0.0] - 2026-10-23
 
 ### Changed
